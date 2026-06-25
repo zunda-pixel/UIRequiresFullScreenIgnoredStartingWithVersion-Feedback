@@ -74,3 +74,6 @@ Is iPadOS 27 intended to ignore `UIRequiresFullScreen` unconditionally (making `
 - `screenshots/03_iPadOS27_false_control.png`
 - `screenshots/04_iPadOS26_5_true_ignore99.png`
 - `screenshots/05_iPadOS26_5_true_ignore26.png`
+
+<img width="200" src="screenshots/01_iPadOS27_true_ignore27.png" /><img width="200" src="screenshots/02_iPadOS27_true_ignore99.png" /><img width="200" src="screenshots/03_iPadOS27_false_control.png" />
+<img width="200" src="screenshots/04_iPadOS26_5_true_ignore99.png" /><img width="200" src="screenshots/05_iPadOS26_5_true_ignore26.png" />
