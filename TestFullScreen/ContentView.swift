@@ -1,6 +1,5 @@
 import SwiftUI
 import UIKit
-import Playgrounds
 
 @main struct MyApp: App {
     var body: some Scene {
@@ -10,28 +9,50 @@ import Playgrounds
     }
 }
 
-/// Diagnostic view to observe, on device/simulator, whether the combination of
-/// `UIRequiresFullScreen` and `UIRequiresFullScreenIgnoredStartingWithVersion` behaves correctly.
+/// Diagnostic view for investigating how `UIRequiresFullScreen` and
+/// `UIRequiresFullScreenIgnoredStartingWithVersion` behave on iPadOS 26+.
 ///
-/// Important: under iPadOS 26+ windowing, `UIScreen` (both `bounds` and `nativeBounds`) is
-/// virtualized as a per-window screen and does NOT report the physical display size. The only
-/// reliable in-app signal is `keyWindow.bounds` (the "Window" row); the screenshot is ground truth.
-/// - Window smaller than the full display  -> `UIRequiresFullScreen` is being ignored (resizable).
-/// - Window always fills the display        -> it is being honored (forced full screen).
-/// `scene.isFullScreen` is shown as the system's raw flag for reference (it can be unreliable in beta).
+/// Findings from this project (Xcode 27 beta; iPadOS 26.5 / 27.0 simulators):
+/// - `UIRequiresFullScreen`'s residual effect is an aspect-ratio / letterbox lock tied to the app's
+///   declared interface orientations, and it is only honored on iPadOS 26.x. A restricted-orientation
+///   app keeps its aspect ratio (letterboxed); an all-orientations app resizes freely. iPadOS 27
+///   ignores the requirement entirely.
+/// - `UIRequiresFullScreenIgnoredStartingWithVersion` had no observable effect in any tested case.
+///
+/// The observable signal is whether the window's aspect ratio stays constant while resizing.
+/// We sample `keyWindow.bounds` (the only reliable geometry on iPadOS 26+; `UIScreen` is virtualized
+/// per-window) and track the min/max observed aspect ratio:
+/// - |max − min| ≈ 0 -> aspect ratio LOCKED
+/// - clear spread    -> aspect ratio FREE
+/// Tap "Reset min/max" to clear the samples before each experiment, then resize the window.
 struct ContentView: View {
     @State private var windowSize: CGSize = .zero
-    @State private var sceneIsFullScreen: Bool = false
+    @State private var minAspect: Double = 0
+    @State private var maxAspect: Double = 0
+    @State private var hasSample: Bool = false
 
     private var requiresFullScreen: String { infoValue("UIRequiresFullScreen") }
     private var ignoredStartingVersion: String { infoValue("UIRequiresFullScreenIgnoredStartingWithVersion") }
     private var configurationName: String { infoValue("ConfigurationName") }
 
+    private var currentAspect: Double {
+        windowSize.height > 0 ? Double(windowSize.width / windowSize.height) : 0
+    }
+
+    /// Verdict based on the aspect-ratio spread observed so far.
+    private var aspectVerdict: String {
+        guard hasSample else { return "— (resize to test)" }
+        let spread = maxAspect - minAspect
+        return spread < 0.02
+            ? "LOCKED (spread \(fmt(spread)))"
+            : "FREE / varies (spread \(fmt(spread)))"
+    }
+
     var body: some View {
         GeometryReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("Full-Screen Requirement Test")
+                    Text("Full-Screen / Aspect-Ratio Test")
                         .font(.title2).bold()
 
                     VStack(alignment: .leading, spacing: 8) {
@@ -45,19 +66,25 @@ struct ContentView: View {
 
                     VStack(alignment: .leading, spacing: 8) {
                         row("Window", value: sizeString(windowSize))
-                        row("scene.isFullScreen", value: sceneIsFullScreen ? "true" : "false")
+                        row("Aspect (w/h)", value: fmt(currentAspect))
+                        row("Aspect min", value: hasSample ? fmt(minAspect) : "—")
+                        row("Aspect max", value: hasSample ? fmt(maxAspect) : "—")
+                        row("Aspect locked?", value: aspectVerdict)
                     }
                     .font(.system(.body, design: .monospaced))
+
+                    Button("Reset min/max") { resetSamples() }
+                        .buttonStyle(.borderedProminent)
 
                     Text(hint)
                         .font(.footnote)
                         .foregroundStyle(.secondary)
-                        .padding(.top, 8)
+                        .padding(.top, 4)
                 }
                 .padding()
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            // proxy.size is used only as a resize trigger; real values are re-read from UIKit.
+            // proxy.size changes on every resize; use it as a trigger to re-sample the real window.
             .onAppear { refresh() }
             .onChange(of: proxy.size) { _, _ in refresh() }
         }
@@ -65,16 +92,32 @@ struct ContentView: View {
 
     private var hint: String {
         """
-        Judge by the Window size (UIScreen is unreliable on iPadOS 26+).
-        • Window smaller than the display -> ignored (resizable)
-        • Window always fills the display -> forced full screen (UIRequiresFullScreen honored)
+        Resize the window (window tiling controls, or drag a corner), then read the verdict.
+        • Aspect stays LOCKED while resizing -> UIRequiresFullScreen honored (aspect-ratio lock)
+        • Aspect varies (FREE) -> the requirement is ignored
+        Judged from keyWindow.bounds (UIScreen is unreliable on iPadOS 26+).
         """
     }
 
     private func refresh() {
-        let scene = activeWindowScene()
-        windowSize = scene?.keyWindow?.bounds.size ?? .zero
-        sceneIsFullScreen = scene?.isFullScreen ?? false
+        windowSize = activeWindowScene()?.keyWindow?.bounds.size ?? .zero
+        let aspect = currentAspect
+        guard aspect > 0 else { return }
+        if hasSample {
+            minAspect = Swift.min(minAspect, aspect)
+            maxAspect = Swift.max(maxAspect, aspect)
+        } else {
+            minAspect = aspect
+            maxAspect = aspect
+            hasSample = true
+        }
+    }
+
+    private func resetSamples() {
+        hasSample = false
+        minAspect = 0
+        maxAspect = 0
+        refresh()
     }
 
     private func activeWindowScene() -> UIWindowScene? {
@@ -83,14 +126,15 @@ struct ContentView: View {
     }
 
     private func infoValue(_ key: String) -> String {
-        if let value = Bundle.main.object(forInfoDictionaryKey: key) {
-            return String(describing: value)
-        }
-        return "(not set)"
+        Bundle.main.object(forInfoDictionaryKey: key).map { String(describing: $0) } ?? "(not set)"
     }
 
     private func sizeString(_ size: CGSize) -> String {
         String(format: "%.0f × %.0f", size.width, size.height)
+    }
+
+    private func fmt(_ value: Double) -> String {
+        String(format: "%.3f", value)
     }
 
     @ViewBuilder private func row(_ label: String, value: String) -> some View {
@@ -104,8 +148,4 @@ struct ContentView: View {
 
 #Preview {
     ContentView()
-}
-
-#Playground {
-    _ = 1 + 2
 }
