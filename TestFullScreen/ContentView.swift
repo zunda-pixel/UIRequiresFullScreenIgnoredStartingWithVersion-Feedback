@@ -9,50 +9,46 @@ import UIKit
     }
 }
 
-/// Diagnostic view for investigating how `UIRequiresFullScreen` and
-/// `UIRequiresFullScreenIgnoredStartingWithVersion` behave on iPadOS 26+.
+/// Diagnostic view for how `UIRequiresFullScreen` behaves on iOS/iPadOS 27+.
 ///
-/// Findings from this project (Xcode 27 beta; iPadOS 26.5 / 27.0 simulators):
-/// - `UIRequiresFullScreen`'s residual effect is an aspect-ratio / letterbox lock tied to the app's
-///   declared interface orientations, and it is only honored on iPadOS 26.x. A restricted-orientation
-///   app keeps its aspect ratio (letterboxed); an all-orientations app resizes freely. iPadOS 27
-///   ignores the requirement entirely.
-/// - `UIRequiresFullScreenIgnoredStartingWithVersion` had no observable effect in any tested case.
+/// Per WWDC26 "Modernize your UIKit app" (Session 278): starting in iOS 27, `UIRequiresFullScreen`
+/// is *honored* in resizable environments and no longer opts the app out of resizing. Instead it
+/// enables **discrete resizing** — as the user changes the scene size the system transitions the
+/// scene to a new *screen configuration* matching that size (so a game always renders full quality),
+/// rather than resizing continuously. `UIRequiresFullScreenIgnoredStartingWithVersion` opts back out
+/// of that (continuous resizing) from the given version onward.
 ///
-/// The observable signal is whether the window's aspect ratio stays constant while resizing.
-/// We sample `keyWindow.bounds` (the only reliable geometry on iPadOS 26+; `UIScreen` is virtualized
-/// per-window) and track the min/max observed aspect ratio:
-/// - |max − min| ≈ 0 -> aspect ratio LOCKED
-/// - clear spread    -> aspect ratio FREE
-/// Tap "Reset min/max" to clear the samples before each experiment, then resize the window.
+/// So the signal to observe is **continuous vs discrete** resizing, not aspect ratio:
+/// - Dragging produces MANY finely-spaced window sizes -> CONTINUOUS (requirement ignored).
+/// - Dragging snaps between a FEW distinct configurations -> DISCRETE (UIRequiresFullScreen honored).
+///
+/// This view records every distinct window size seen (`keyWindow.bounds`, the only reliable geometry
+/// on iPadOS 26+) so you can drag-resize and inspect whether the sizes form a smooth ramp or a few
+/// chunky configurations. Tap "Reset" before each experiment.
 struct ContentView: View {
-    @State private var windowSize: CGSize = .zero
-    @State private var minAspect: Double = 0
-    @State private var maxAspect: Double = 0
-    @State private var hasSample: Bool = false
+    /// Distinct window sizes observed, in order (consecutive duplicates collapsed).
+    @State private var sizes: [CGSize] = []
 
     private var requiresFullScreen: String { infoValue("UIRequiresFullScreen") }
     private var ignoredStartingVersion: String { infoValue("UIRequiresFullScreenIgnoredStartingWithVersion") }
     private var configurationName: String { infoValue("ConfigurationName") }
 
-    private var currentAspect: Double {
-        windowSize.height > 0 ? Double(windowSize.width / windowSize.height) : 0
-    }
+    private var current: CGSize { sizes.last ?? .zero }
 
-    /// Verdict based on the aspect-ratio spread observed so far.
-    private var aspectVerdict: String {
-        guard hasSample else { return "— (resize to test)" }
-        let spread = maxAspect - minAspect
-        return spread < 0.02
-            ? "LOCKED (spread \(fmt(spread)))"
-            : "FREE / varies (spread \(fmt(spread)))"
+    /// Heuristic read on the samples so far (the size list below is the real evidence).
+    private var verdict: String {
+        switch sizes.count {
+        case 0, 1: return "— (resize to test)"
+        case 2...6: return "few steps → looks DISCRETE"
+        default: return "many sizes → looks CONTINUOUS"
+        }
     }
 
     var body: some View {
         GeometryReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("Full-Screen / Aspect-Ratio Test")
+                    Text("Discrete-Resizing Test")
                         .font(.title2).bold()
 
                     VStack(alignment: .leading, spacing: 8) {
@@ -65,16 +61,25 @@ struct ContentView: View {
                     Divider()
 
                     VStack(alignment: .leading, spacing: 8) {
-                        row("Window", value: sizeString(windowSize))
-                        row("Aspect (w/h)", value: fmt(currentAspect))
-                        row("Aspect min", value: hasSample ? fmt(minAspect) : "—")
-                        row("Aspect max", value: hasSample ? fmt(maxAspect) : "—")
-                        row("Aspect locked?", value: aspectVerdict)
+                        row("Window", value: sizeString(current))
+                        row("Distinct sizes", value: "\(sizes.count)")
+                        row("Resizing looks", value: verdict)
                     }
                     .font(.system(.body, design: .monospaced))
 
-                    Button("Reset min/max") { resetSamples() }
+                    Button("Reset") { sizes.removeAll(); record(proxy.size) }
                         .buttonStyle(.borderedProminent)
+
+                    if !sizes.isEmpty {
+                        Text("Observed sizes (newest first):")
+                            .font(.footnote).foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            ForEach(Array(sizes.enumerated().reversed()), id: \.offset) { _, size in
+                                Text(sizeString(size))
+                            }
+                        }
+                        .font(.system(.caption, design: .monospaced))
+                    }
 
                     Text(hint)
                         .font(.footnote)
@@ -84,40 +89,32 @@ struct ContentView: View {
                 .padding()
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            // proxy.size changes on every resize; use it as a trigger to re-sample the real window.
-            .onAppear { refresh() }
-            .onChange(of: proxy.size) { _, _ in refresh() }
+            .onAppear { record(currentWindowSize()) }
+            .onChange(of: proxy.size) { _, _ in record(currentWindowSize()) }
         }
     }
 
     private var hint: String {
         """
-        Resize the window (window tiling controls, or drag a corner), then read the verdict.
-        • Aspect stays LOCKED while resizing -> UIRequiresFullScreen honored (aspect-ratio lock)
-        • Aspect varies (FREE) -> the requirement is ignored
-        Judged from keyWindow.bounds (UIScreen is unreliable on iPadOS 26+).
+        Drag a window corner slowly across a wide range, then read the list.
+        • Many finely-spaced sizes -> CONTINUOUS resizing (requirement ignored)
+        • A few distinct configurations (big jumps) -> DISCRETE resizing (UIRequiresFullScreen honored)
+        Sizes come from keyWindow.bounds (UIScreen is unreliable on iPadOS 26+).
         """
     }
 
-    private func refresh() {
-        windowSize = activeWindowScene()?.keyWindow?.bounds.size ?? .zero
-        let aspect = currentAspect
-        guard aspect > 0 else { return }
-        if hasSample {
-            minAspect = Swift.min(minAspect, aspect)
-            maxAspect = Swift.max(maxAspect, aspect)
-        } else {
-            minAspect = aspect
-            maxAspect = aspect
-            hasSample = true
+    /// Append the size if it differs from the most recent one (collapse consecutive duplicates).
+    private func record(_ size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        if let last = sizes.last, abs(last.width - size.width) < 1, abs(last.height - size.height) < 1 {
+            return
         }
+        sizes.append(size)
+        if sizes.count > 60 { sizes.removeFirst(sizes.count - 60) }
     }
 
-    private func resetSamples() {
-        hasSample = false
-        minAspect = 0
-        maxAspect = 0
-        refresh()
+    private func currentWindowSize() -> CGSize {
+        activeWindowScene()?.keyWindow?.bounds.size ?? .zero
     }
 
     private func activeWindowScene() -> UIWindowScene? {
@@ -131,10 +128,6 @@ struct ContentView: View {
 
     private func sizeString(_ size: CGSize) -> String {
         String(format: "%.0f × %.0f", size.width, size.height)
-    }
-
-    private func fmt(_ value: Double) -> String {
-        String(format: "%.3f", value)
     }
 
     @ViewBuilder private func row(_ label: String, value: String) -> some View {
